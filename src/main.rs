@@ -1,75 +1,97 @@
-use std::io::Write;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use std::io::{Read, Write};
+use std::str;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::StreamExt;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::Result;
 
-async fn client(mut conn: TcpStream) -> Result<()> {
-    let mut buf = Vec::new();
-    let _ = writeln!(&mut buf, "Hello world").map_err(|err| {
-        eprintln!(
-            "[ERROR]: failed to write message to buffer because of {:?}",
-            err
-        );
-    });
-    conn.write(&buf).await?;
+type Conn = Arc<TcpStream>;
 
-    let mut buf = [0; 64]; 
+enum Event {
+    Connected(Conn),
+    Message(Box<[u8]>),
+}
+
+async fn client(conn: Conn, events: Sender<Event>) -> Result<()> {
+    let _ = events
+        .send(Event::Connected(conn.clone()))
+        .await
+        .map_err(|err| {
+            println!("[ERROR]: failed to connect client to server, {:?}", err);
+        });
+
+    let mut buf = [0; 64];
     loop {
-        match conn.read(&mut buf).await {
+        match conn.as_ref().read(&mut buf).await {
             Ok(0) => {
                 println!("[INFO]: client disconnected");
                 break;
-            },
+            }
             Ok(n) => {
-                println!("The length of the buffer {n}");
-            },
-            Err(_) => {
-                break;
+                let bytes = buf[0..n].iter().cloned().filter(|b| *b >= 32).collect();
+                let _ = events.send(Event::Message(bytes)).await.map(|err| {
+                    eprintln!(
+                        "[ERROR]: Failed to send bytes to server from client, {:?}",
+                        err
+                    );
+                });
+            }
+            Err(err) => {
+                println!(
+                    "[ERROR]: An error occured while reading bytes from client, {:?}",
+                    err
+                );
             }
         }
     }
-    
+
+    return Ok(());
+}
+
+async fn server(mut events: Receiver<Event>) -> Result<()> {
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::Connected(conn) => {
+                let _ = writeln!(conn.as_ref(), "Welcome to the chatroom").map_err(|err| {
+                    eprintln!("[ERROR]: failed to write welcome message, {:?}", err);
+                });
+                println!("[INFO]: client connected.");
+            }
+            Event::Message(message) => {
+                if let Ok(message) = str::from_utf8(&message) {
+                    println!("[INFO]: client sent message: {message}");
+                }
+            }
+        }
+    }
     return Ok(());
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:3000").await?;
-    let mut stream = TcpListenerStream::new(listener);
+
+    let (tx, rx) = mpsc::channel::<Event>(10);
+
+    tokio::spawn(server(rx));
 
     println!("[INFO]: server started at 127.0.0.1:3000");
 
-    while let Some(conn) = stream.next().await {
-        match conn {
-            Ok(c) => {
-                let _ = client(c).await;
-                println!("[INFO]: client connected.");
-
-            },
-            Err(err) => {
-                eprintln!("[ERROR]: client failed to connect. {:?}", err);
+    loop {
+        match listener.accept().await {
+            Ok(conn) => {
+                let conn = Arc::new(conn);
+                let sender = tx.clone();
+                let _ = client(conn, sender).await;
+            }
+            Err(_) => {
+                eprintln!("[ERROR]: failed to accept new connections");
+                break;
             }
         }
-    } 
+    }
 
-    Ok(())
-
-    /* let (tx, mut rx) = mpsc::channel(100);
-
-    tokio::spawn(async move {
-        for i in 0..10 {
-            sleep(Duration::from_secs(1)).await;
-            if let Err(_) = tx.send(i).await {
-                println!("receiver dropped");
-                return;
-            }
-        }
-    });
-
-    while let Some(i) = rx.recv().await {
-        println!("got = {}", i);
-    } */
+    return Ok(());
 }
